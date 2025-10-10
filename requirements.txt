@@ -1,0 +1,5 @@
+numpy
+pandas
+tqdm
+torch==2.4.0
+transformers==4.46.1

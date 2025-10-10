@@ -1,0 +1,17 @@
+{
+    "0": "Qwen/Qwen2.5-0.5B-Instruct",
+    "1": "meta-llama/Llama-3.2-1B-Instruct",
+    "2": "Qwen/Qwen2.5-1.5B-Instruct",
+    "3": "google/gemma-2-2b-it",
+    "4": "meta-llama/Llama-3.2-3B-Instruct",
+    "5": "01ai/Yi-1.5-6B-Chat",
+    "6": "Qwen/Qwen2.5-7B-Instruct",
+    "7": "mistralai/Ministral-8B-Instruct-2410",
+    "8": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "9": "01ai/Yi-1.5-9B-Chat",
+    "10": "Qwen/Qwen2.5-3B-Instruct",
+    "11": "Qwen/Qwen2.5-14B-Instruct",
+    "12": "Qwen/Qwen2.5-32B-Instruct",
+    "13": "Qwen/Qwen2.5-72B-Instruct",
+    "14": "meta-llama/Llama-3.3-70B-Instruct"
+}
