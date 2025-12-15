@@ -214,7 +214,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         data_type=args.data_type,
         task_type=args.task_type,
-        num_models=args.num_models,   # ←追加
+        num_models=args.num_models,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
