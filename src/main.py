@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassific
 from utils import *
 from dataset import get_dataloader
 from model import RAGRouter
+import torch.nn.functional as F
 warnings.simplefilter(action='ignore', category=Warning)
 
 
@@ -61,65 +62,116 @@ def contrastive_loss(x1, x0, labels, labelso, temperature=0.2):
     
     return total_loss / num_pos
 
+def binary_route_loss(cls_preds, cls_predso, labels, labelso):
+    # A: 0.6B+RAG (x1[:,0]), B: 14B noRAG (x0[:,1])
+    a_logit = cls_preds[:, 0]
+    b_logit = cls_predso[:, 1]
+    diff = a_logit - b_logit # probability difference
+
+    a = labels[:, 0]
+    b = labelso[:, 1]
+    mask = (a + b == 1) # calculate loss only when there is a difference: A is correct and B is not, or vice versa
+
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=cls_preds.device), mask
+
+    y = a[mask]  # ground truth
+    loss = F.binary_cross_entropy_with_logits(diff[mask], y)
+    return loss, mask
 
 def evaluate(net, test_loader, device, epoch):
     net.eval()
-    loss_fn_cls = nn.BCEWithLogitsLoss()
-    total_loss = 0
-    loss_cls = 0
-    loss_ct = 0
+    total_loss = 0.0
+    total_used = 0  # number of samples used for loss calculation. different samples only
+    correct_all = 0 # for calculating router accuracy over all samples
     num_samples = 0
-    res = {'pred': [], 'label': []}
+
     with torch.no_grad():
         for texts, querys, docs, labels, labelso in tqdm(test_loader):
             texts, querys, docs, labels, labelso = texts.to(device), querys.to(device), docs.to(device), labels.to(device), labelso.to(device)
             cls_preds, cls_predso = net(texts, querys, docs)
 
-            loss = args.lambda1 * loss_fn_cls(cls_preds, labels) + args.lambda1 * loss_fn_cls(cls_predso, labelso) + contrastive_loss(cls_preds, cls_predso, labels, labelso, args.tau)
-            total_loss += loss.item()
-            loss_cls += loss_fn_cls(cls_preds, labels).item()
-            loss_ct += contrastive_loss(cls_preds, cls_predso, labels, labelso, args.tau)
-            num_samples += labels.shape[0]
+            # calculate loss only when there is a difference
+            loss, mask = binary_route_loss(cls_preds, cls_predso, labels, labelso)
+            used = int(mask.sum().item())
+            total_loss += loss.item() * used
+            total_used += used
 
-            res['pred'].extend(torch.sigmoid(cls_preds).flatten().tolist())
-            res['label'].extend(labels.flatten().tolist())
+            # accuracy output: use all query data
+            batch_size = labels.shape[0]
+            num_samples += batch_size
 
-    save_csv(res, f'results/{args.id}/res-{args.id}-{epoch + 1}.csv')
-    router_acc = eval_router(read_csv(f'results/{args.id}/res-{args.id}-{epoch + 1}.csv'), all=num_samples, num_models=args.num_models)
-    print(f'Test Loss: {loss_cls / (num_samples * args.num_models)}, {loss_ct}')
-    mean_loss = total_loss / (num_samples * args.num_models)
+            diff = cls_preds[:, 0] - cls_predso[:, 1]
+            pred_is_A = (diff > 0)
+
+            # ground truth
+            is_A_correct = labels[:, 0].bool()
+            is_B_correct = labelso[:, 1].bool()
+
+            # When router chooses A: 0.6B+RAG is better, which is correct
+            case_A_better = (is_A_correct & ~is_B_correct) & pred_is_A
+            
+            # When router chooses A: 14B is better, which is correct
+            case_B_better = (~is_A_correct & is_B_correct) & (~pred_is_A)
+            
+            # When both are correct or both are incorrect -> whichever router chooses is correct
+            case_tie = (is_A_correct == is_B_correct)
+
+            batch_correct = (case_A_better | case_B_better | case_tie).sum().item()
+            correct_all += batch_correct
+
+    mean_loss = (total_loss / total_used) if total_used > 0 else 0.0
+    
+    # calculate router accuracy over all samples (not just used samples)
+    router_acc = correct_all / num_samples if num_samples > 0 else 0.0
+
+    print(f"Test (binary) Loss: {mean_loss:.6f}, Oracle Match Acc: {router_acc:.4f}, Total Samples: {num_samples}")
+
     net.train()
     return mean_loss, router_acc
 
 
 # Main training loop
-def train(net, train_loader, test_loader, device):
+def train(net, train_loader, test_loader, device): # check evaluate() for reference
     optimizer = AdamW(net.parameters(), lr=args.learning_rate)
     scheduler = lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.gamma)
-    loss_fn_cls = nn.BCEWithLogitsLoss()
 
     for epoch in range(args.num_epochs):
         net.train()
-        total_loss = 0
-        loss_cls = 0
-        loss_ct = 0
+        total_loss = 0.0
+        total_used = 0 # number of samples used for loss calculation
+        correct = 0
+        num_samples = 0
+
         for texts, querys, docs, labels, labelso in tqdm(train_loader):
             texts, querys, docs, labels, labelso = texts.to(device), querys.to(device), docs.to(device), labels.to(device), labelso.to(device)
             optimizer.zero_grad()
             cls_preds, cls_predso = net(texts, querys, docs)
-            loss = args.lambda1 * loss_fn_cls(cls_preds, labels) + args.lambda1 * loss_fn_cls(cls_predso, labelso) + contrastive_loss(cls_preds, cls_predso, labels, labelso, args.tau)
+            loss, mask = binary_route_loss(cls_preds, cls_predso, labels, labelso)
+            used = int(mask.sum().item())
+            if used == 0:
+                num_samples += labels.shape[0]
+                continue
+
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-            loss_cls += loss_fn_cls(cls_preds, labels).item()
-            loss_ct += contrastive_loss(cls_preds, cls_predso, labels, labelso, args.tau)
 
-        train_loss = total_loss / len(train_loader)
-        loss_cls = loss_cls / len(train_loader)
-        loss_ct = loss_ct / len(train_loader)
-        print(f"Epoch {epoch + 1}/{args.num_epochs}, Train Loss: {train_loss}, {loss_cls}, {loss_ct}")
+            total_loss += loss.item() * used
+            total_used += used
+            num_samples += labels.shape[0]
+
+            diff = cls_preds[:, 0] - cls_predso[:, 1]
+            y = labels[:, 0][mask]
+            pred = (diff[mask] > 0).float()
+            correct += int((pred == y).sum().item())
+
+        mean_loss = (total_loss / total_used) if total_used > 0 else 0.0
+        train_acc = (correct / total_used) if total_used > 0 else 0.0
+        print(f"Epoch {epoch + 1}/{args.num_epochs}, Train (binary) Loss: {mean_loss:.6f}, Acc: {train_acc:.4f}, Used: {total_used}/{num_samples}")
+
         test_loss, router_acc = evaluate(net, test_loader, device, epoch)
-        print(f"Test Loss: {test_loss}, Accuracy: {router_acc}")
+        print(f"Epoch {epoch + 1}/{args.num_epochs}, Test (binary) Loss: {test_loss:.6f}, Acc: {router_acc:.4f}")
+
         torch.save(net, f'checkpoints/{args.id}/{args.id}-{epoch + 1}.pth')
         scheduler.step()
         
@@ -157,11 +209,12 @@ if __name__ == "__main__":
     encoder_model = AutoModel.from_pretrained(encoder_path)
     tokenizer = AutoTokenizer.from_pretrained(encoder_path)
     train_loader, test_loader = get_dataloader(
-        tokenizer=tokenizer, 
-        tokenizer_all=tokenizer_all, 
+        tokenizer=tokenizer,
+        tokenizer_all=tokenizer_all,
         batch_size=args.batch_size,
         data_type=args.data_type,
-        task_type=args.task_type
+        task_type=args.task_type,
+        num_models=args.num_models,   # ←追加
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
