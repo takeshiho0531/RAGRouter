@@ -1,0 +1,12 @@
+
+# large datasets
+data/**/doc_map.json
+
+checkpoints/
+results/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+data/triviaqa/pairs.csv
