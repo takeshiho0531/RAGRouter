@@ -62,74 +62,41 @@ def contrastive_loss(x1, x0, labels, labelso, temperature=0.2):
     
     return total_loss / num_pos
 
-def binary_route_loss(cls_preds, cls_predso, labels, labelso):
-    # A: 0.6B+RAG (x1[:,0]), B: 14B noRAG (x0[:,1])
-    a_logit = cls_preds[:, 0]
-    b_logit = cls_predso[:, 1]
-    diff = a_logit - b_logit # probability difference
+def binary_success_loss(cls_preds, labels):
+    # labels[:, 0]: label for RAG success
+    # cls_preds[:, 0]: logit for RAG success
+    rag_logit = cls_preds[:, 0]
+    rag_label = labels[:, 0]
 
-    a = labels[:, 0]
-    b = labelso[:, 1]
-    mask = (a + b == 1) # calculate loss only when there is a difference: A is correct and B is not, or vice versa
-
-    if mask.sum() == 0:
-        return torch.tensor(0.0, device=cls_preds.device), mask
-
-    y = a[mask]  # ground truth
-    loss = F.binary_cross_entropy_with_logits(diff[mask], y)
-    return loss, mask
+    loss = F.binary_cross_entropy_with_logits(rag_logit, rag_label)
+    return loss
 
 def evaluate(net, test_loader, device, epoch):
     net.eval()
     total_loss = 0.0
-    total_used = 0  # number of samples used for loss calculation. different samples only
-    correct_all = 0 # for calculating router accuracy over all samples
+    correct = 0
     num_samples = 0
 
     with torch.no_grad():
         for texts, querys, docs, labels, labelso in tqdm(test_loader):
             texts, querys, docs, labels, labelso = texts.to(device), querys.to(device), docs.to(device), labels.to(device), labelso.to(device)
-            cls_preds, cls_predso = net(texts, querys, docs)
+            cls_preds, _ = net(texts, querys, docs) # cls_predsoは使わない
 
-            # calculate loss only when there is a difference
-            loss, mask = binary_route_loss(cls_preds, cls_predso, labels, labelso)
-            used = int(mask.sum().item())
-            total_loss += loss.item() * used
-            total_used += used
+            loss = binary_success_loss(cls_preds, labels)
+            total_loss += loss.item() * labels.size(0)
 
-            # accuracy output: use all query data
-            batch_size = labels.shape[0]
-            num_samples += batch_size
+            rag_pred = (cls_preds[:, 0] > 0).float()
+            rag_true = labels[:, 0]
 
-            diff = cls_preds[:, 0] - cls_predso[:, 1]
-            pred_is_A = (diff > 0)
+            correct += (rag_pred == rag_true).sum().item()
+            num_samples += labels.size(0)
 
-            # ground truth
-            is_A_correct = labels[:, 0].bool()
-            is_B_correct = labelso[:, 1].bool()
+    mean_loss = total_loss / num_samples
+    accuracy = correct / num_samples
 
-            # When router chooses A: 0.6B+RAG is better, which is correct
-            case_A_better = (is_A_correct & ~is_B_correct) & pred_is_A
-            
-            # When router chooses A: 14B is better, which is correct
-            case_B_better = (~is_A_correct & is_B_correct) & (~pred_is_A)
-            
-            # When both are correct or both are incorrect -> whichever router chooses is correct
-            case_tie = (is_A_correct == is_B_correct)
-
-            batch_correct = (case_A_better | case_B_better | case_tie).sum().item()
-            correct_all += batch_correct
-
-    mean_loss = (total_loss / total_used) if total_used > 0 else 0.0
-    
-    # calculate router accuracy over all samples (not just used samples)
-    router_acc = correct_all / num_samples if num_samples > 0 else 0.0
-
-    print(f"Test (binary) Loss: {mean_loss:.6f}, Oracle Match Acc: {router_acc:.4f}, Total Samples: {num_samples}")
-
+    print(f"Test Loss: {mean_loss:.6f}, Success Predictor Acc: {accuracy:.4f}")
     net.train()
-    return mean_loss, router_acc
-
+    return mean_loss, accuracy
 
 # Main training loop
 def train(net, train_loader, test_loader, device): # check evaluate() for reference
@@ -146,24 +113,19 @@ def train(net, train_loader, test_loader, device): # check evaluate() for refere
         for texts, querys, docs, labels, labelso in tqdm(train_loader):
             texts, querys, docs, labels, labelso = texts.to(device), querys.to(device), docs.to(device), labels.to(device), labelso.to(device)
             optimizer.zero_grad()
-            cls_preds, cls_predso = net(texts, querys, docs)
-            loss, mask = binary_route_loss(cls_preds, cls_predso, labels, labelso)
-            used = int(mask.sum().item())
-            if used == 0:
-                num_samples += labels.shape[0]
-                continue
+            cls_preds, _ = net(texts, querys, docs)
+            loss = binary_success_loss(cls_preds, labels)
 
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * used
-            total_used += used
-            num_samples += labels.shape[0]
+            batch_size_current = labels.size(0)
+            total_loss += loss.item() * labels.size(0)
 
-            diff = cls_preds[:, 0] - cls_predso[:, 1]
-            y = labels[:, 0][mask]
-            pred = (diff[mask] > 0).float()
-            correct += int((pred == y).sum().item())
+            rag_pred = (cls_preds[:, 0] > 0).float()
+            correct += (rag_pred == labels[:, 0]).sum().item()
+            total_used += batch_size_current
+            num_samples += labels.size(0)
 
         mean_loss = (total_loss / total_used) if total_used > 0 else 0.0
         train_acc = (correct / total_used) if total_used > 0 else 0.0

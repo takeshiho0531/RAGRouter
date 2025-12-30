@@ -73,63 +73,46 @@ class SimpleRouteDataset(Dataset):
 
 def evaluate(model, dataloader, device):
     model.eval()
-
-    total_system_correct = 0 # the number of samples where the chosen model answered correctly to the query
-    total_router_choice_correct = 0 # the number of samples where the correct model was chosen by the router
     
     total_samples = 0
+    correct_preds = 0
     total_loss = 0
-    total_diff = 0
     loss_fn = nn.BCEWithLogitsLoss()
+
+    # 指標計算用
+    tp, fp, tn, fn = 0, 0, 0, 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             label_rag = batch['label_rag'].to(device)
-            label_norag = batch['label_norag'].to(device)
 
             outputs = model(input_ids, attention_mask=attention_mask)
             logits = outputs.logits.view(-1)
             
-            # logit > 0: choose RAG model, predicts_is_rag True
-            # logit <=0: choose No-RAG model, predicts_is_rag False
-            preds_is_rag = (logits > 0) 
+            loss = loss_fn(logits, label_rag)
+            total_loss += loss.item() * len(label_rag)
 
-            for i in range(len(label_rag)):
-                l_rag = label_rag[i].item()
-                l_norag = label_norag[i].item()
-                chose_rag = preds_is_rag[i].item()
+            preds = (logits > 0).float()
+            correct_preds += (preds == label_rag).sum().item()
+            total_samples += len(label_rag)
 
-                if chose_rag:
-                    if l_rag == 1.0:
-                        total_system_correct += 1
-                else:
-                    if l_norag == 1.0:
-                        total_system_correct += 1
+            # 詳細な指標用
+            for p, r in zip(preds, label_rag):
+                if p == 1 and r == 1: tp += 1
+                elif p == 1 and r == 0: fp += 1
+                elif p == 0 and r == 0: tn += 1
+                elif p == 0 and r == 1: fn += 1
 
-                if l_rag == l_norag: # both correct or both incorrect
-                    total_router_choice_correct += 1
-                else:
-                    if l_rag == 1.0 and chose_rag: # RAG is correct and RAG was chosen
-                        total_router_choice_correct += 1
-
-                    elif l_norag == 1.0 and not chose_rag: # No-RAG is correct and No-RAG was chosen
-                        total_router_choice_correct += 1
-
-                if l_rag != l_norag:
-                    target = 1.0 if l_rag == 1.0 else 0.0
-                    total_loss += loss_fn(logits[i], torch.tensor(target, device=device)).item()
-                    total_diff += 1 
-
-                total_samples += 1
-
-    avg_system_acc = total_system_correct / total_samples if total_samples > 0 else 0
-    avg_choice_acc = total_router_choice_correct / total_samples if total_samples > 0 else 0
-    avg_loss = total_loss / total_diff if total_diff > 0 else 0
+    avg_loss = total_loss / total_samples
+    acc = correct_preds / total_samples
     
-    return avg_system_acc, avg_choice_acc, avg_loss
-
+    # 適合率・再現率（RAGが成功すると予測した時の信頼度）
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    
+    return acc, avg_loss, precision, recall
 
 def train(args):
     setup_seed(args.seed)
@@ -167,11 +150,12 @@ def train(args):
     best_acc = 0.0
 
     print("Start Training...")
+    print("Start Training Success Predictor...")
     for epoch in range(args.num_epochs):
         model.train()
         total_loss = 0
         correct = 0
-        total_effective = 0
+        total_samples = 0
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}"):
             optimizer.zero_grad()
@@ -179,46 +163,37 @@ def train(args):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             label_rag = batch['label_rag'].to(device)
-            label_norag = batch['label_norag'].to(device)
-
-            # use as training data only when there is a difference; rag is correct and no-rag is not, or vice versa
-            mask = (label_rag + label_norag) == 1
-            if mask.sum() == 0:
-                continue
 
             outputs = model(input_ids, attention_mask=attention_mask)
             logits = outputs.logits.view(-1)
 
-            active_logits = logits[mask]
-            active_targets = label_rag[mask]
-            # Since only one of them (0.6B+RAG vs non-RAG 14B) is correct, it's possible to use label_rag as the target directly
-            loss = loss_fn(active_logits, active_targets)
+            # 差分マスクを使わず、全データで学習
+            loss = loss_fn(logits, label_rag)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * mask.sum().item()
-            total_effective += mask.sum().item()
+            total_loss += loss.item() * len(label_rag)
+            total_samples += len(label_rag)
 
-            preds = (active_logits > 0).float()
-            correct += (preds == active_targets).sum().item()
+            preds = (logits > 0).float()
+            correct += (preds == label_rag).sum().item()
 
-        train_loss = total_loss / total_effective if total_effective > 0 else 0
-        train_acc = correct / total_effective if total_effective > 0 else 0
+        train_loss = total_loss / total_samples
+        train_acc = correct / total_samples
 
-        sys_acc, choice_acc, eval_loss = evaluate(model, test_loader, device)
-        print(f"  Eval Loss (diff-only): {eval_loss:.4f}")
+        # 評価
+        test_acc, test_loss, prec, rec = evaluate(model, test_loader, device)
         
         print(f"Epoch {epoch+1}:")
-        print(f"  Train Loss: {train_loss:.4f}")
-        print(f"  System Acc (End-to-End): {sys_acc:.4f} (the accuracy of data answered correctly by the chosen model)")
-        print(f"  Router Acc (Choice Only): {choice_acc:.4f} (the accuracy of the router choosing the correct model)")
+        print(f"  Train Acc: {train_acc:.4f}, Loss: {train_loss:.4f}")
+        print(f"  Test  Acc: {test_acc:.4f}, Loss: {test_loss:.4f}")
+        print(f"  Precision: {prec:.4f}, Recall: {rec:.4f}")
 
-        if sys_acc > best_acc: 
-            best_acc = sys_acc
-            save_path = f'checkpoints/{args.id}_best.pth'
-            torch.save(model.state_dict(), save_path)
-            print(f"  Saved Best Model based on System Acc")
-
+        if test_acc > best_acc: 
+            best_acc = test_acc
+            torch.save(model.state_dict(), f'checkpoints/{args.id}_best.pth')
+            print(f"  Saved Best Success Predictor Model")
+            
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=32)

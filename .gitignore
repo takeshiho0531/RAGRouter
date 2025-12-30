@@ -9,4 +9,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.jsonl
 data/triviaqa/pairs.csv
+data/triviaqa_20000/ce_score_train.csv
+data/triviaqa_20000/ce_score_test.csv
