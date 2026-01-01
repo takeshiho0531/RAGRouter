@@ -10,3 +10,5 @@ __pycache__/
 *.pyo
 *.pyd
 data/triviaqa/pairs.csv
+data/triviaqa_20000/triviaqa::olmes_q_retrieved_results::_IVFPQ.65536.64.256::k5.jsonl
+data/triviaqa_full/triviaqa::olmes_q_retrieved_results::_IVFPQ.65536.64.256::k5.jsonl
