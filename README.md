@@ -1,3 +1,25 @@
+# Router Preformance
+this commit, src/lightgbm_router.py, triviaqa_full
+```
+Aggressive Delta Optimized: 0.590
+
+=== System Performance Evaluation ===
+Total System Accuracy: 0.6308 (Baseline 14B: 0.6132)
+RAG Call Rate: 12.21%
+
+=== Router Decision Quality (Is RAG really needed?) ===
+Router Selection Accuracy: 0.8084
+├─ Precision (batting accuracy / effective RAG): 0.2420
+├─ Recall    (coverage / rescue rate): 0.2297
+└─ MCC       (overall plate discipline): 0.1263
+
+Confusion Matrix (Selection Strategy):
+                Pred: 14B | Pred: RAG
+Actual: 14B-OK:     5958 |       708 (Overkill or Waste)
+Actual: NeedRAG:     758 |       226 (Saved!)
+```
+<br>
+
 # RAGRouter: Learning to Route Queries to Multiple Retrieval-Augmented Language Models
 
 ## Environment Setup

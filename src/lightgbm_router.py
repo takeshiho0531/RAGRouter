@@ -3,14 +3,27 @@ import pandas as pd
 import lightgbm as lgb
 import json
 import argparse
-from sklearn.metrics import accuracy_score, classification_report, recall_score
+import os
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+    matthews_corrcoef,
+)
 from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
 from sentence_transformers import SentenceTransformer
-from utils import json2dict
+
+
+def json2dict(path):
+    with open(path, "r") as f:
+        return json.load(f)
 
 
 def load_scores_and_data(jsonl_path):
-    print(f"Loading retrieval results from {jsonl_path}...")
+    if not os.path.exists(jsonl_path):
+        return [], np.zeros((0, 5))
     scores_list = []
     query_ids = []
     with open(jsonl_path, "r") as f:
@@ -29,198 +42,193 @@ class FeatureExtractor:
     def __init__(self, model_name="all-MiniLM-L6-v2", device="cuda"):
         self.model = SentenceTransformer(model_name, device=device)
 
-    def get_features(
-        self,
-        queries,
-        docs,
-        scores_np,
-        ce_scores_top5,
-        query_emb_pca=None,
-        doc_emb_pca=None,
-    ):
+    def get_features(self, queries, scores_np, ce_scores_top5, query_emb_pca=None):
         ce_top1 = ce_scores_top5[:, 0].reshape(-1, 1)
         ce_max = np.max(ce_scores_top5, axis=1).reshape(-1, 1)
 
-        agreement_score = (scores_np[:, 0].reshape(-1, 1)) * ce_top1
+        # retrieveal confidence features: whether the top retrieved context is clearly better than the second best
+        ce_diff = (ce_scores_top5[:, 0] - ce_scores_top5[:, 1]).reshape(-1, 1)
+        ret_diff = (scores_np[:, 0] - scores_np[:, 1]).reshape(-1, 1)
 
-        q_char_len = np.array([len(q) for q in queries]).reshape(-1, 1)
-        q_word_count = np.array([len(q.split()) for q in queries]).reshape(-1, 1)
+        # how difficult is the query?
+        q_len = np.array([len(q) for q in queries]).reshape(-1, 1)
+        q_words = np.array([len(q.split()) for q in queries]).reshape(-1, 1)
 
-        features_list = [ce_top1, ce_max, agreement_score, q_char_len, q_word_count]
+        features_list = [ce_top1, ce_max, ce_diff, ret_diff, q_len, q_words]
 
         if query_emb_pca is not None:
             features_list.append(query_emb_pca)
-        if doc_emb_pca is not None:
-            features_list.append(doc_emb_pca)
 
         return np.hstack(features_list)
 
 
-def prepare_data(args, extractor):
+class CascadeRouter:
+    def __init__(
+        self, trust_14b_threshold=0.85
+    ):  # strict threshold so that 14B is trusted often
+        self.model_14b = None
+        self.model_06b_rag = None
+        self.trust_threshold = trust_14b_threshold
+        self.best_delta = 0.0
+        self.params = {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "num_leaves": 63,
+            "max_depth": 8,
+            "learning_rate": 0.005,
+            "feature_fraction": 0.8,
+            "verbose": -1,
+        }
+
+    def train(self, X_train, y_14b, y_rag):
+        X_t, X_v, y14_t, y14_v, yrag_t, yrag_v = train_test_split(
+            X_train, y_14b, y_rag, test_size=0.15, random_state=42
+        )
+
+        print("Training 14B Success Predictor...")
+        self.model_14b = lgb.train(self.params, lgb.Dataset(X_t, label=y14_t), 2000)
+
+        print("Training 0.6B+RAG Success Predictor...")
+        target_mask = (y14_t == 0) & (yrag_t == 1)
+        sample_weights = np.where(target_mask, 15.0, 1.0)  # ターゲットへの執着を強化
+        self.model_06b_rag = lgb.train(
+            self.params, lgb.Dataset(X_t, label=yrag_t, weight=sample_weights), 2000
+        )
+
+        self._optimize_router_strict(X_v, y14_v, yrag_v)
+
+    def _optimize_router_strict(self, X_val, y14_val, yrag_val):
+        """
+        Reduce overkill (a case using RAG though it's useless) while maximizing the Router's selection accuracy (14B vs RAG)
+        """
+        print("Optimizing for Strict Selection Accuracy...")
+        X_val_14b = X_val.copy()
+        X_val_14b[:, 0:4] = 0.0
+        p14 = self.model_14b.predict(X_val_14b)
+        p06 = self.model_06b_rag.predict(X_val)
+        benefit = p06 - p14
+
+        # groud_truth: RAG is truly needed when 14B fails (0) and RAG succeeds (1). Otherwise, 0.
+        ground_truth = ((y14_val == 0) & (yrag_val == 1)).astype(int)
+
+        best_score = -1.0
+        penalty_weight = 0.25  # weight to reduce calls to RAG
+
+        for d in np.linspace(
+            0.3, 0.7, 81
+        ):  # explore deltas in higher range in order to reduce calls of unnecessary RAG
+            route = (p14 < self.trust_threshold) & (benefit > d)
+            if np.sum(route) == 0:
+                continue
+
+            # Router's selection accuracy
+            mcc = matthews_corrcoef(ground_truth, route.astype(int))
+            score = mcc - (penalty_weight * np.mean(route))
+
+            if score > best_score:
+                best_score = score
+                self.best_delta = d
+
+        print(f"Aggressive Delta Optimized: {self.best_delta:.3f}")
+
+    def predict_route(self, X):
+        X_14b = X.copy()
+        X_14b[:, 0:4] = 0.0
+        p14 = self.model_14b.predict(X_14b)
+        p06 = self.model_06b_rag.predict(X)
+        benefit = p06 - p14
+        route_to_rag = (p14 < self.trust_threshold) & (benefit > self.best_delta)
+        return route_to_rag, p14, p06
+
+
+def prepare_datasets(args, extractor):
     jsonl_path = f"data/{args.data_type}/triviaqa::olmes_q_retrieved_results::_IVFPQ.65536.64.256::k5.jsonl"
     qid_list, all_scores = load_scores_and_data(jsonl_path)
     score_map = dict(zip(qid_list, all_scores))
-
     query_map = json2dict(f"data/{args.data_type}/query_map.json")
-    doc_map = json2dict(f"data/{args.data_type}/doc_map.json")
 
-    dfs = {}
-    all_queries_text = []
-    all_docs_text = []
-
-    for split in ["train", "test"]:
-        df = pd.read_csv(f"data/{args.data_type}/{split}_{args.task_type}.csv")
-        df["query_id_str"] = df["query_id"].astype(str)
-        dfs[split] = df
-        all_queries_text.extend([query_map.get(str(qid), "") for qid in df["query_id"]])
-        all_docs_text.extend([doc_map.get(str(did), "") for did in df["doc_id"]])
-
-    print("Encoding embeddings for PCA...")
-    all_query_embs = extractor.model.encode(all_queries_text, show_progress_bar=True)
-    all_doc_embs = extractor.model.encode(all_docs_text, show_progress_bar=True)
-
-    n_q_pca = 64
-    n_d_pca = 16
-    print(f"Computing PCA (Q:{n_q_pca}, D:{n_d_pca})...")
-    pca_query = PCA(n_components=n_q_pca)
-    pca_doc = PCA(n_components=n_d_pca)
-    all_queries_pca = pca_query.fit_transform(all_query_embs)
-    all_docs_pca = pca_doc.fit_transform(all_doc_embs)
-
-    start_idx = 0
     datasets = {}
     for split in ["train", "test"]:
-        df = dfs[split]
-        num_samples = len(df)
-        split_q_pca = all_queries_pca[start_idx : start_idx + num_samples]
-        split_d_pca = all_docs_pca[start_idx : start_idx + num_samples]
-        start_idx += num_samples
+        df = pd.read_csv(f"data/{args.data_type}/{split}_local.csv")
+        df["query_id_str"] = df["query_id"].astype(str)
+
+        queries_text = [query_map.get(str(qid), "") for qid in df["query_id"]]
+        # using 128-dim to secure expressiveness
+        q_pca = PCA(n_components=128).fit_transform(
+            extractor.model.encode(queries_text, show_progress_bar=True)
+        )
 
         ce_path = f"data/{args.data_type}/ce_score_top5_{'train_stacking' if split == 'train' else 'all'}.csv"
         ce_df = pd.read_csv(ce_path)
         ce_df["query_id"] = ce_df["query_id"].astype(str)
-
-        merged_df = pd.merge(
+        merged = pd.merge(
             df, ce_df, left_on="query_id_str", right_on="query_id", how="left"
         )
-        ce_scores_top5 = (
-            merged_df[[f"ce_score_{i}" for i in range(1, 6)]].fillna(0.0).values
-        )
-        queries = [query_map.get(str(qid), "") for qid in merged_df["query_id_str"]]
-        docs = [doc_map.get(str(did), "") for did in merged_df["doc_id"]]
-        batch_scores = np.array(
-            [score_map.get(qid, [0.0] * 5) for qid in merged_df["query_id_str"]]
-        )
 
-        l_rag = merged_df["0"].values.astype(float)
-        norag_df = pd.read_csv(f"data/{args.data_type}/{split}.csv")
-        l_norag = norag_df["1"].values.astype(float)
+        ce_scores = merged[[f"ce_score_{i}" for i in range(1, 6)]].fillna(0.0).values
+        batch_scores = np.array(
+            [score_map.get(qid, [0.0] * 5) for qid in merged["query_id_str"]]
+        )
 
         X = extractor.get_features(
-            queries,
-            docs,
-            batch_scores,
-            ce_scores_top5,
-            query_emb_pca=split_q_pca,
-            doc_emb_pca=split_d_pca,
+            queries_text, batch_scores, ce_scores, query_emb_pca=q_pca
         )
-        datasets[split] = {"X": X, "l_rag": l_rag, "l_norag": l_norag}
+        y_rag = merged["0"].values.astype(float)
+        y_14b = pd.read_csv(f"data/{args.data_type}/{split}.csv")["1"].values.astype(
+            float
+        )
+
+        datasets[split] = {"X": X, "y_14b": y_14b, "y_rag": y_rag}
     return datasets
 
 
-def train_lightgbm(datasets, args):
-    print("\n=== Training Targeted Router (High-Dim PCA) ===")
-    X_train = datasets["train"]["X"]
-    y_train = (
-        (datasets["train"]["l_rag"] == 1.0) & (datasets["train"]["l_norag"] == 0.0)
-    ).astype(int)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_type", type=str, default="triviaqa_full")
+    parser.add_argument(
+        "--trust_14b", type=float, default=0.82
+    )  # threshold for trusting 14B model
+    args = parser.parse_args()
 
-    weights = np.where(y_train == 1, 8.0, 1.0)
-    train_data = lgb.Dataset(X_train, label=y_train, weight=weights)
+    extractor = FeatureExtractor()
+    data = prepare_datasets(args, extractor)
 
-    params = {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "num_leaves": 31,
-        "max_depth": 6,
-        "learning_rate": 0.01,
-        "min_data_in_leaf": 50,
-        "feature_fraction": 0.7,
-        "lambda_l1": 2.0,
-        "lambda_l2": 2.0,
-        "verbose": -1,
-    }
+    router = CascadeRouter(trust_14b_threshold=args.trust_14b)
+    router.train(data["train"]["X"], data["train"]["y_14b"], data["train"]["y_rag"])
 
-    gbm = lgb.train(params, train_data, num_boost_round=1500)
+    preds_is_rag, p14, p06 = router.predict_route(data["test"]["X"])
+    y14, yrag = data["test"]["y_14b"], data["test"]["y_rag"]
 
-    n_q_pca = 64
-    n_d_pca = 16
-    feature_names = ["ce_top1", "ce_max", "agreement", "q_char_len", "q_word_count"]
-    feature_names += [f"q_pca_{i+1}" for i in range(n_q_pca)]
-    feature_names += [f"d_pca_{i+1}" for i in range(n_d_pca)]
+    # accuracy across the test dataset
+    final_res = np.where(preds_is_rag, yrag, y14)
+    system_acc = np.mean(final_res)
 
-    print("\n=== Feature Importance (Top 10) ===")
-    importance = gbm.feature_importance(importance_type="gain")
-    feat_imp = pd.DataFrame(
-        {"feature": feature_names, "importance": importance}
-    ).sort_values("importance", ascending=False)
-    print(feat_imp.head(10))
+    # Router's selection correctness
+    # when 14B fails (0) and RAG succeeds (1), RAG was truly needed. Otherwise, 14B was sufficient.
+    router_target = ((y14 == 0) & (yrag == 1)).astype(int)
+    router_preds = preds_is_rag.astype(int)
 
-    y_probs_train = gbm.predict(X_train)
-    best_thr = 0.5
-    max_acc = 0
-    for thr in np.arange(0.1, 0.9, 0.01):
-        preds = (y_probs_train > thr).astype(int)
-        rec = recall_score(y_train, preds)
-        acc = accuracy_score(y_train, preds)
-        if rec >= 0.65:
-            if acc > max_acc:
-                max_acc = acc
-                best_thr = thr
+    r_acc = accuracy_score(router_target, router_preds)
+    r_pre = precision_score(router_target, router_preds, zero_division=0)
+    r_rec = recall_score(router_target, router_preds, zero_division=0)
+    r_mcc = matthews_corrcoef(router_target, router_preds)
 
-    print(f"\nBest Threshold (Recall-Focused): {best_thr:.3f}")
-    evaluate_router(gbm, datasets["test"], threshold=best_thr)
+    print(f"=== System Performance Evaluation ===")
+    print(f"Total System Accuracy: {system_acc:.4f} (Baseline 14B: {np.mean(y14):.4f})")
+    print(f"RAG Call Rate: {np.mean(preds_is_rag):.2%}")
 
+    print(f"=== Router Decision Quality (Is RAG really needed?) ===")
+    print(f"Router Selection Accuracy: {r_acc:.4f}")
+    print(f"├─ Precision (batting accuracy / effective RAG): {r_pre:.4f}")
+    print(f"├─ Recall    (coverage / rescue rate): {r_rec:.4f}")
+    print(f"└─ MCC       (overall plate discipline): {r_mcc:.4f}")
 
-def evaluate_router(model, test_data, threshold=0.5):
-    X_test = test_data["X"]
-    l_rag, l_norag = test_data["l_rag"], test_data["l_norag"]
-    probs = model.predict(X_test)
-    preds_is_rag = probs > threshold
-
-    # evaluate router's classification performance
-    y_true_router = ((l_rag == 1.0) & (l_norag == 0.0)).astype(int)
-    y_pred_router = preds_is_rag.astype(int)
-
-    print("\n=== Router Classification Performance (Is it a 14B miss?) ===")
-    # Target_Miss: 14B_Miss_RAG_Save,
-    # Other: Other
-    print(
-        classification_report(
-            y_true_router, y_pred_router, target_names=["Other", "14B_Miss_RAG_Save"]
-        )
-    )
-
-    # evaluate system-level performance (accuracy and recall for the entire evaluation dataset)
-    miss_mask = y_true_router == 1
-    saved = sum(preds_is_rag & miss_mask)
-    total_miss = sum(miss_mask)
-
-    print("=== System Level Evaluation ===")
-    print(f"Recall (Saved 14B misses): {saved/total_miss:.4f} ({saved}/{total_miss})")
-
-    correct = 0
-    for i in range(len(l_rag)):
-        if (l_rag[i] if preds_is_rag[i] else l_norag[i]) == 1.0:
-            correct += 1
-    print(f"Total System Accuracy: {correct / len(l_rag):.4f}")
+    cm = confusion_matrix(router_target, router_preds)
+    print(f"Confusion Matrix (Selection Strategy):")
+    print(f"                Pred: 14B | Pred: RAG")
+    print(f"Actual: 14B-OK:  {cm[0,0]:>7} | {cm[0,1]:>9} (Overkill or Waste)")
+    print(f"Actual: NeedRAG: {cm[1,0]:>7} | {cm[1,1]:>9} (Saved!)")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_type", type=str, default="triviaqa_full")
-    parser.add_argument("--task_type", type=str, default="local")
-    args = parser.parse_args()
-    extractor = FeatureExtractor()
-    datasets = prepare_data(args, extractor)
-    train_lightgbm(datasets, args)
+    main()
