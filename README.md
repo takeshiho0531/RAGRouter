@@ -1,22 +1,99 @@
 # Router Preformance
-this commit, src/lightgbm_router.py, triviaqa_full
+this commit, src/lightgbm_router.py, triviaqa_full, trust_14b 0.85
 ```
-Aggressive Delta Optimized: 0.590
-
+Optimizing Delta (MCC - Penalty)...
+energy_penalty_weight: 0.15
+Aggressive Delta Optimized: 0.375
 === System Performance Evaluation ===
-Total System Accuracy: 0.6308 (Baseline 14B: 0.6132)
-RAG Call Rate: 12.21%
-
+Total System Accuracy: 0.6366 (Baseline 14B: 0.6132)
+RAG Call Rate: 15.02%
 === Router Decision Quality (Is RAG really needed?) ===
-Router Selection Accuracy: 0.8084
-├─ Precision (batting accuracy / effective RAG): 0.2420
-├─ Recall    (coverage / rescue rate): 0.2297
-└─ MCC       (overall plate discipline): 0.1263
-
+Router Selection Accuracy: 0.8033
+├─ Precision (batting accuracy / effective RAG): 0.2733
+├─ Recall    (coverage / rescue rate): 0.3191
+└─ MCC       (overall plate discipline): 0.1816
 Confusion Matrix (Selection Strategy):
                 Pred: 14B | Pred: RAG
-Actual: 14B-OK:     5958 |       708 (Overkill or Waste)
-Actual: NeedRAG:     758 |       226 (Saved!)
+Actual: 14B-OK:     5831 |       835 (Overkill or Waste)
+Actual: NeedRAG:     670 |       314 (Saved!)
+--- Feature Importance (14B) Top 10 ---
+           f             v
+10   q_pca_3  47604.561095
+7    q_pca_0  36507.856471
+11   q_pca_4  16306.642071
+9    q_pca_2  15241.300001
+20  q_pca_13  15225.657823
+8    q_pca_1  13259.520516
+13   q_pca_6  10759.955159
+14   q_pca_7  10563.693863
+24  q_pca_17  10329.205142
+16   q_pca_9  10133.222225
+--- Feature Importance (0.6B+RAG) Top 10 ---
+            f              v
+1      ce_max  362982.327156
+39    d_pca_0   31224.583567
+0     ce_top1   23666.918295
+15    q_pca_8   18405.996265
+6   agreement   13777.885805
+43    d_pca_4   10769.355595
+7     q_pca_0   10718.352192
+4       q_len   10634.244312
+42    d_pca_3    9729.045513
+40    d_pca_1    8976.483500
+```
+<br>
+
+## Prediction Performance of 14B's Success
+this commit, src/14b_predictor.py, triviaqa_full
+```
+# pca_dim 16
+========================================
+  14B Success Prediction Results
+========================================
+Accuracy:  0.6536
+ROC-AUC:   0.6683
+MCC:       0.2232
+Confusion Matrix:
+                Pred: Fail | Pred: Success
+Actual: Fail:          990 |         1969
+Actual: Success:       681 |         4010
+
+
+# pca_dim 32
+========================================
+  14B Success Prediction Results
+========================================
+Accuracy:  0.6561
+ROC-AUC:   0.6768
+MCC:       0.2321
+Confusion Matrix:
+                Pred: Fail | Pred: Success
+Actual: Fail:         1053 |         1906
+Actual: Success:       725 |         3966
+
+# pca_dim 64
+========================================
+  14B Success Prediction Results
+========================================
+Accuracy:  0.6607
+ROC-AUC:   0.6784
+MCC:       0.2434
+Confusion Matrix:
+                Pred: Fail | Pred: Success
+Actual: Fail:         1074 |         1885
+Actual: Success:       711 |         3980
+
+# pca_dim 128
+========================================
+  14B Success Prediction Results
+========================================
+Accuracy:  0.6613
+ROC-AUC:   0.6846
+MCC:       0.2448
+Confusion Matrix:
+                Pred: Fail | Pred: Success
+Actual: Fail:         1072 |         1887
+Actual: Success:       704 |         3987
 ```
 <br>
 
