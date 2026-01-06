@@ -1,5 +1,5 @@
 # Router Preformance
-this commit, src/lightgbm_router.py, triviaqa_full, trust_14b 0.85
+- this commit, src/lightgbm_router.py, triviaqa_full, trust_14b 0.85
 ```
 Optimizing Delta (MCC - Penalty)...
 energy_penalty_weight: 0.15
@@ -42,6 +42,34 @@ Actual: NeedRAG:     670 |       314 (Saved!)
 40    d_pca_1    8976.483500
 ```
 <br>
+
+- this commit, src/direct_predictor.py, triviaqa_full
+```
+=== System Performance Evaluation ===
+Total System Accuracy: 0.6260 (Baseline 14B: 0.6132)
+RAG Call Rate: 3.82%
+=== Router Decision Quality (NeedRAG detection) ===
+Router Selection Accuracy: 0.8654
+├─ Precision (effective RAG): 0.4212
+├─ Recall    (rescue rate):   0.1250
+└─ MCC       (overall):       0.1741
+Confusion Matrix (NeedRAG target):
+                Pred: noRAG | Pred: RAG
+Actual: noNeed:    6497 |       169 (Overkill/Waste)
+Actual: NeedRAG:    861 |       123 (Saved!)
+--- Feature Importance (NeedRAG) Top 10 ---
+          f              v
+1    ce_max  126068.968639
+39  d_pca_0   88678.006817
+42  d_pca_3   54323.648632
+7   q_pca_0   38333.225603
+10  q_pca_3   33706.846739
+40  d_pca_1   27758.218220
+15  q_pca_8   27666.524347
+45  d_pca_6   20573.294090
+4     q_len   19402.841909
+47  d_pca_8   16661.484509
+```
 
 ## Prediction Performance of 14B's Success
 this commit, src/14b_predictor.py, triviaqa_full
